@@ -1,3 +1,5 @@
 
 .DS_Store
 commitAndPush.py
+brace_sentiment.csv
+receiver_sentiment.csv
