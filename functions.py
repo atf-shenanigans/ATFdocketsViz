@@ -1,3 +1,5 @@
+import requests
+import json
 import pandas as pd
 from wordcloud import WordCloud
 import re
@@ -11,7 +13,7 @@ import numpy as np
 from bokeh.palettes import plasma
 from bokeh.plotting import figure, show
 from bokeh.embed import components
-from bokeh.models import DatetimeTickFormatter
+from bokeh.models import DatetimeTickFormatter,HoverTool
 import math
 
 
@@ -19,6 +21,7 @@ from bokeh.palettes import plasma
 from bokeh.plotting import figure, show
 from bokeh.embed import components
 from bokeh.models import DatetimeTickFormatter
+from bokeh.io import output_notebook
 import math
 
 from bokeh.core.properties import value
@@ -28,439 +31,566 @@ from bokeh.plotting import figure
 from bokeh.transform import dodge
 from bokeh.models import SingleIntervalTicker, NumeralTickFormatter,Range1d, LinearAxis
 from bokeh.layouts import column
-from bokeh.models.widgets import Tabs, Panel
+from bokeh.layouts import gridplot
+# from bokeh.models.widgets import Tabs, Panel
+from bokeh.models import TabPanel
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.wait import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+# from webdriver_manager.chrome import ChromeDriverManager
 
-receiverDF = pd.read_csv(r'receiver_sentiment.csv', index_col='idx', header=0)
-braceDF = pd.read_csv(r'brace_sentiment.csv', index_col='idx', header=0)
+# new headless stuff
+from selenium.webdriver.chrome.options import Options
 
-def getP1():
-    #####################GENERATE RECEIVERS BY DAY #########################
-    print(len(receiverDF))
-    g1 = receiverDF.groupby(['receiveDate_dt',"sentimentPosition"], as_index = False).size()
-    g1 = g1.pivot_table(values='size'
+################ REFRESH DATA##################
+
+def getApproved(docketID):
+    commentsURL='https://api.regulations.gov/v4/comments?filter[commentOnId]='+docketID+'&api_key=apiKey'
+    commentsRes =  requests.get(commentsURL, verify=True)        
+    commentsMeta = json.loads(commentsRes.content.decode("utf-8"))
+    commentsAgg = json.loads(commentsRes.content.decode("utf-8"))['meta']
+    commentsCount = 0
+    if commentsAgg:
+        commentsCount = commentsAgg['totalElements']
+    
+    return commentsCount+1
+
+def getSubmitted(docketName):
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument('---incognito')
+    chrome_options.add_argument('---disable-extension')
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--headless")
+    # chrome_options.add_argument("--disable-gpu")
+    browser = webdriver.Chrome(options=chrome_options)
+    try:
+        browser.get("https://www.regulations.gov/document/"+docketName)
+        wait = WebDriverWait(browser,5)
+        wait.until(EC.visibility_of_element_located((By.XPATH, '//p[@class="mb-0 js-comments-received"]')))
+        element = browser.find_element(By.XPATH, '//p[@class="mb-0 js-comments-received"]').text
+    except:
+        element = '0'
+        
+
+    finally:
+        browser.quit()
+    return int(element.replace(',',''))
+
+def getStatsString(html, title, submitted, approved, unpublished, downloaded, unscored):
+    if html:
+        baseString='<p>{0}</p>\n<p>{1:,} submitted</p>\n<p>{2:,} approved</p>\n<p>{3:,} unpublished</p>\n<p>{4:,} downloaded</p>\n<p>{5:,} left to download</p>'
+        stringFormatted = baseString.format(title, submitted, approved, unpublished, downloaded, unscored)
+    else:
+        baseString = '{0}\n{1:,} submitted\n{2:,} approved\n{3:,} unpublished\n{4:,} downloaded\n{5:,} left to download'
+        stringFormatted = baseString.format(title, submitted, approved, unpublished, downloaded, unscored )
+        
+    return stringFormatted
+
+def getDailyChart(df, title):
+    print(len(df))
+    df['receiveDate_dt'] = pd.to_datetime(df['receiveDate']).apply(lambda x: x.replace(tzinfo=None))
+    g = df.groupby(['receiveDate_dt',"sentimentPosition"], as_index = False).size()
+    g = g.pivot_table(values='size'
+                    , index='receiveDate_dt'
+                    , columns='sentimentPosition'
+                    , aggfunc='first').reset_index().rename_axis(None, axis=1)#.set_index('receiveDate_dt')
+    g.fillna(0, inplace=True)
+
+    #convert datetimes to strings
+    g['receiveDate_dt'] = g['receiveDate_dt'].dt.strftime('%Y-%m-%d')
+    #convert dataframe to dict
+    data = g.to_dict(orient='list')
+    dates = g['receiveDate_dt'].tolist()
+
+    source = ColumnDataSource(data=data)
+
+
+    #get max possible value of plotted columns with some offset
+    p = figure( width=chartWidth
+               , height=chartHeight
+               , x_range=dates
+               , y_range=(0, g[['neutral','oppose', 'support']].values.max() + 5000)
+               , title=title
+               , toolbar_location="left"
+               , tools="pan,wheel_zoom,box_zoom,reset")
+
+    p.vbar(x=dodge('receiveDate_dt', -.2, range=p.x_range), top='support', width=0.2, source=source,
+           color="#1A71F2", legend_label="support")
+
+    p.vbar(x=dodge('receiveDate_dt',  0,  range=p.x_range), top='oppose', width=0.2, source=source,
+           color="#F92518", legend_label="oppose")
+
+    p.vbar(x=dodge('receiveDate_dt',  .2,  range=p.x_range), top='neutral', width=0.2, source=source,
+           color="#DEDEDE", legend_label="neutral")
+
+    p.add_tools(HoverTool(tooltips=[("Date","@receiveDate_dt")
+                                     , ("Oppose", "@oppose")
+                                     , ("Support", "@support")
+                                     , ("Neutral", "@neutral")]))
+    
+    p.xaxis.formatter=DatetimeTickFormatter(
+            hours="%I:00 %p",
+            days="%m-%d",
+            months="%m-%d",
+            years="%m-%d"
+    )
+
+    p.xaxis.major_label_orientation = math.pi/2
+    p.xaxis.major_label_text_color = '#FFFFFF'
+    p.yaxis.major_label_text_color = '#FFFFFF'
+
+    p.title.text_color = '#FFFFFF'
+
+    p.xaxis.axis_line_color = '#FFFFFF'
+    p.yaxis.axis_line_color = '#FFFFFF'
+
+    p.xaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.minor_tick_line_color = '#FFFFFF'   
+
+    p.xgrid.grid_line_color = '#333333'
+    p.ygrid.grid_line_color = '#5C5B5B'
+    p.ygrid.minor_grid_line_color = '#373636'
+
+    p.toolbar.logo = None
+    p.border_fill_color = '#191919'
+    p.background_fill_color = '#191919'
+    p.legend.background_fill_alpha = 0.7
+
+    p.x_range.range_padding = 0.03
+    p.xgrid.grid_line_color = None
+    p.legend.location = "top_center"
+    p.legend.orientation = "horizontal"
+    p.yaxis[0].ticker.desired_num_ticks = 10
+
+    return p
+
+def getCumlDailyChart(df, title):
+################################cumulative comment by day############################
+    df['receiveDate_dt'] = pd.to_datetime(df['receiveDate']).apply(lambda x: x.replace(tzinfo=None))
+
+    g = df.groupby(['receiveDate_dt',"sentimentPosition"], as_index = False).size()
+    g = g.pivot_table(values='size'
                         , index='receiveDate_dt'
                         , columns='sentimentPosition'
                         , aggfunc='first').reset_index().rename_axis(None, axis=1)#.set_index('receiveDate_dt')
-    g1.fillna(0, inplace=True)
-    g1['total']=g1.sum(axis=1)
+    g.fillna(0, inplace=True)
+    g['receiveDate_dt'] = g['receiveDate_dt'].dt.strftime('%Y-%m-%d')
 
-    #convert datetimes to strings
-    g1['receiveDate_dt'] = g1['receiveDate_dt'].dt.strftime('%Y-%m-%d')
+    g1 = g.set_index('receiveDate_dt').cumsum()
+    g1= g1.reset_index()
+
     #convert dataframe to dict
     data1 = g1.to_dict(orient='list')
     dates1 = g1['receiveDate_dt'].tolist()
 
-    def getds():
-        source = ColumnDataSource(data=data1)
-        return source
+    source1 = ColumnDataSource(data=data1)
+
 
     #get max possible value of plotted columns with some offset
-    p1 = figure( width=1200
-               , height=800
+    p = figure( width=chartWidth
+               , height=chartHeight
                , x_range=dates1
-               , y_range=(0, g1[['neutral','oppose', 'support']].values.max() + 1000)
-               , title="Comment Sentiment by Day on ATF Docket (ATF-2021-0001)\nDefinition of Frame or Receiver and Identification of Firearms"
-               , toolbar_location=None
-               , tools="")
-    p1.vbar(x=dodge('receiveDate_dt', -.2, range=p1.x_range), top='support', width=0.2, source=getds(),
-           color="#1A71F2", legend_label="support")
-    p1.vbar(x=dodge('receiveDate_dt',  0,  range=p1.x_range), top='oppose', width=0.2, source=getds(),
-           color="#F92518", legend_label="oppose")
+               , y_range=(0, g1[['neutral','oppose', 'support']].values.max() + 10000)
+               , title=title
+               , toolbar_location="left"
+               , tools="pan,wheel_zoom,box_zoom,reset")
 
-    p1.vbar(x=dodge('receiveDate_dt',  .2,  range=p1.x_range), top='neutral', width=0.2, source=getds(),
-           color="#DEDEDE", legend_label="neutral")
-    p1.xaxis.formatter=DatetimeTickFormatter(
-        hours=["%I:00 %p"],
-        days=["%m-%d"],
-        months=["%m-%d"],
-        years=["%m-%d"]
-    )
-    p1.xaxis.major_label_orientation = math.pi/2
-    p1.xaxis.major_label_text_color = '#FFFFFF'
-    p1.yaxis.major_label_text_color = '#FFFFFF'
+    p.line('receiveDate_dt', 'support', line_width=2, line_color="#1A71F2", legend_label='support', source=source1)
+    p.line('receiveDate_dt', 'oppose', line_width=2, line_color="#F92518", legend_label='oppose', source=source1)
+    p.line('receiveDate_dt', 'neutral', line_width=2, line_color="#DEDEDE", legend_label='neutral', source=source1)
 
-    p1.title.text_color = '#FFFFFF'
-
-    p1.xaxis.axis_line_color = '#FFFFFF'
-    p1.yaxis.axis_line_color = '#FFFFFF'
-
-    p1.xaxis.major_tick_line_color = '#FFFFFF'
-    p1.yaxis.major_tick_line_color = '#FFFFFF'
-    p1.yaxis.minor_tick_line_color = '#FFFFFF'   
-
-    p1.xgrid.grid_line_color = '#333333'
-    p1.ygrid.grid_line_color = '#5C5B5B'
-    p1.ygrid.minor_grid_line_color = '#373636'
-
-    p1.toolbar.logo = None
-    p1.border_fill_color = '#191919'
-    p1.background_fill_color = '#191919'
-    p1.legend.background_fill_alpha = 0.7
-
-    p1.x_range.range_padding = 0.03
-    p1.xgrid.grid_line_color = None
-    p1.legend.location = "top_center"
-    p1.legend.orientation = "horizontal"
-    p1.yaxis[0].ticker.desired_num_ticks = 10
-    return p1
-
-def getP2():
-    ################################cumulative comment by day############################
-    g1 = receiverDF.groupby(['receiveDate_dt',"sentimentPosition"], as_index = False).size()
-    g1 = g1.pivot_table(values='size'
-                        , index='receiveDate_dt'
-                        , columns='sentimentPosition'
-                        , aggfunc='first').reset_index().rename_axis(None, axis=1)#.set_index('receiveDate_dt')
-    g1.fillna(0, inplace=True)
-    g1['total']=g1.sum(axis=1)
-    g1['receiveDate_dt'] = g1['receiveDate_dt'].dt.strftime('%Y-%m-%d')
+    p.add_tools(HoverTool(tooltips=[("Date","@receiveDate_dt")
+                                     , ("Oppose", "@oppose")
+                                     , ("Support", "@support")
+                                     , ("Neutral", "@neutral")
+                                     ]
+                            )
+                 )
     
-    g2 = g1.set_index('receiveDate_dt').cumsum()
-    g2= g2.reset_index()
-    #convert dataframe to dict
-    data2 = g2.to_dict(orient='list')
-    dates2 = g2['receiveDate_dt'].tolist()
-
-    source2 = ColumnDataSource(data=data2)
-    #get max possible value of plotted columns with some offset
-    p2 = figure( width=1200
-               , height=800
-               , x_range=dates2
-               , y_range=(0, g2[['neutral','oppose', 'support']].values.max() + 10000)
-               , title="Cumulative Comment Sentiment by Day on ATF Docket (ATF-2021-0001)\nDefinition of Frame or Receiver and Identification of Firearms"
-               , toolbar_location=None
-               , tools="")
-
-    p2.line('receiveDate_dt', 'support', line_width=2, line_color="#1A71F2", legend_label='support', source=source2)
-    p2.line('receiveDate_dt', 'oppose', line_width=2, line_color="#F92518", legend_label='oppose', source=source2)
-    p2.line('receiveDate_dt', 'neutral', line_width=2, line_color="#DEDEDE", legend_label='neutral', source=source2)
-
-    p2.xaxis.formatter=DatetimeTickFormatter(
-            hours=["%I:00 %p"],
-            days=["%m-%d"],
-            months=["%m-%d"],
-            years=["%m-%d"]
+    p.xaxis.formatter=DatetimeTickFormatter(
+            hours="%I:00 %p",
+            days="%m-%d",
+            months="%m-%d",
+            years="%m-%d"
     )
-    p2.xaxis.major_label_orientation = math.pi/2
-    p2.xaxis.major_label_text_color = '#FFFFFF'
-    p2.yaxis.major_label_text_color = '#FFFFFF'
 
-    p2.title.text_color = '#FFFFFF'
+    p.xaxis.major_label_orientation = math.pi/2
+    p.xaxis.major_label_text_color = '#FFFFFF'
+    p.yaxis.major_label_text_color = '#FFFFFF'
 
-    p2.xaxis.axis_line_color = '#FFFFFF'
-    p2.yaxis.axis_line_color = '#FFFFFF'
+    p.title.text_color = '#FFFFFF'
 
-    p2.xaxis.major_tick_line_color = '#FFFFFF'
-    p2.yaxis.major_tick_line_color = '#FFFFFF'
-    p2.yaxis.minor_tick_line_color = '#FFFFFF'   
+    p.xaxis.axis_line_color = '#FFFFFF'
+    p.yaxis.axis_line_color = '#FFFFFF'
 
-    p2.xgrid.grid_line_color = '#333333'
-    p2.ygrid.grid_line_color = '#5C5B5B'
-    p2.ygrid.minor_grid_line_color = '#373636'
+    p.xaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.minor_tick_line_color = '#FFFFFF'   
 
-    p2.toolbar.logo = None
-    p2.border_fill_color = '#191919'
-    p2.background_fill_color = '#191919'
-    p2.legend.background_fill_alpha = 0.7
+    p.xgrid.grid_line_color = '#333333'
+    p.ygrid.grid_line_color = '#5C5B5B'
+    p.ygrid.minor_grid_line_color = '#373636'
 
-    p2.x_range.range_padding = 0.03
-    p2.xgrid.grid_line_color = None
-    p2.legend.location = "top_center"
-    p2.legend.orientation = "horizontal"
-    p2.yaxis[0].ticker.desired_num_ticks = 10
-    p2.yaxis.formatter=NumeralTickFormatter(format="0")
-    return p2
+    p.toolbar.logo = None
+    p.border_fill_color = '#191919'
+    p.background_fill_color = '#191919'
+    p.legend.background_fill_alpha = 0.7
 
-def getP3():
+    p.x_range.range_padding = 0.03
+    p.xgrid.grid_line_color = None
+    p.legend.location = "top_center"
+    p.legend.orientation = "horizontal"
+    p.yaxis[0].ticker.desired_num_ticks = 10
+    p.yaxis.formatter=NumeralTickFormatter(format="0")
+    return p
+
+def getCommentsAprovedByDay(df, title):
     #####################GENERATE RECEIVERS Approval Rate HTML #########################
-    receiverDF['postedDate_dt'] = pd.to_datetime(receiverDF['postedDate']).apply(lambda x: x.replace(tzinfo=None))
-    receiverDF['receiveDate_dt'] = pd.to_datetime(receiverDF['receiveDate']).apply(lambda x: x.replace(tzinfo=None))
-    receiverDF['processLagDays'] = (receiverDF['postedDate_dt'] - receiverDF['receiveDate_dt']).dt.days
 
-    g3 = receiverDF.groupby('postedDate_dt').agg({'comment':'size', 'processLagDays':'mean'})
-    g3.fillna(0, inplace=True)
-    g3= g3.reset_index()
+    df['postedDate'] = pd.to_datetime(df['postedDate']).apply(lambda x: x.replace(tzinfo=None))
+    df['receiveDate'] = pd.to_datetime(df['receiveDate']).apply(lambda x: x.replace(tzinfo=None))
+    df['processLagDays'] = (df['postedDate'] - df['receiveDate']).dt.days
+
+    g = df.groupby('postedDate').agg({'comment':'size', 'processLagDays':'mean'})
+    g.fillna(0, inplace=True)
+    g= g.reset_index()
     #convert datetimes to strings
-    g3['postedDate_dt'] = g3['postedDate_dt'].dt.strftime('%Y-%m-%d')
+    g['postedDate'] = g['postedDate'].dt.strftime('%Y-%m-%d')
     #convert dataframe to dict
-    data3 = g3.to_dict(orient='list')
-    dates3 = g3['postedDate_dt'].tolist()
-    source3 = ColumnDataSource(data=data3)
-    #get max possible value of plotted columns with some offset
-    p3= figure( width=1200
-               , height=800
-    #            , x_axis_type="datetime"
-               , x_range=dates3
-               , y_range=(0, g3[['comment']].values.max() + 1000)
-               , y_axis_label="Count of Comments Published"
-               , title="Count of Comments approved by Day on ATF Docket (ATF-2021-0001)\nDefinition of Frame or Receiver and Identification of Firearms"
-               , toolbar_location=None
-               , tools="")
-    p3.extra_y_ranges = {"processLagDays": Range1d(start=0, end=g3['processLagDays'].values.max()+1)}
-    p3.add_layout(LinearAxis(y_range_name="processLagDays",axis_label_text_color='#FFFFFF', axis_label='Days between Submission and Publication'), 'right')
+    data = g.to_dict(orient='list')
+    dates = g['postedDate'].tolist()
+    source = ColumnDataSource(data=data)
 
-    p3.vbar(x=dodge('postedDate_dt',  0,  range=p3.x_range), top='comment', width=0.2
-            , source=source3, color="#DEDEDE", legend_label="Count of Comments Published by Day")
-    p3.line('postedDate_dt'
+
+    #get max possible value of plotted columns with some offset
+    p= figure( width=chartWidth
+               , height=chartHeight
+               , x_range=dates
+               , y_range=(0, g[['comment']].values.max() + 1000)
+               , y_axis_label="Count of Comments Published"
+               , title= title
+               , toolbar_location="left"
+               , tools="pan,wheel_zoom,box_zoom,reset")
+    p.extra_y_ranges = {"processLagDays": Range1d(start=0, end=g['processLagDays'].values.max()+1)}
+    p.add_layout(LinearAxis(y_range_name="processLagDays",axis_label_text_color='#FFFFFF', axis_label='Avg Days from Sumbit to Publish'), 'right')
+
+    p.vbar(x=dodge('postedDate',  0,  range=p.x_range), top='comment', width=0.2
+          , source=source, color="#DEDEDE", legend_label="Count of Comments Published by Day")
+    p.line('postedDate'
            , 'processLagDays'
            , line_width=2
            , line_color="#1A71F2"
            , legend_label='Days between Submission and Publication'
-           , source=source3
+           , source=source
            , y_range_name = 'processLagDays'
           )
 
-    p3.xaxis.formatter=DatetimeTickFormatter(
-            hours=["%I:00 %p"],
-            days=["%m-%d"],
-            months=["%m-%d"],
-            years=["%m-%d"]
+    p.add_tools(HoverTool(tooltips=[("Posted Date","@postedDate")
+                                     ,("Processed", "@comment")
+                                     , ("Days of Lag", "@processLagDays")]))
+    
+    p.xaxis.formatter=DatetimeTickFormatter(
+            hours="%I:00 %p",
+            days="%m-%d",
+            months="%m-%d",
+            years="%m-%d"
     )
-    p3.xaxis.major_label_orientation = math.pi/2
-    p3.xaxis.major_label_text_color = '#FFFFFF'
 
-    p3.title.text_color = '#FFFFFF'
+    p.xaxis.major_label_orientation = math.pi/2
+    p.xaxis.major_label_text_color = '#FFFFFF'
 
-    p3.xaxis.axis_line_color = '#FFFFFF'
-    p3.yaxis.axis_line_color = '#FFFFFF'
-    p3.yaxis.major_label_text_color = '#FFFFFF'
+    p.title.text_color = '#FFFFFF'
 
-    p3.xaxis.major_tick_line_color = '#FFFFFF'
-    p3.yaxis.major_tick_line_color = '#FFFFFF'
-    p3.yaxis.minor_tick_line_color = '#FFFFFF'   
-    p3.yaxis.axis_label_text_color='#FFFFFF'
+    p.xaxis.axis_line_color = '#FFFFFF'
+    p.yaxis.axis_line_color = '#FFFFFF'
+    p.yaxis.major_label_text_color = '#FFFFFF'
 
-    p3.xgrid.grid_line_color = '#333333'
-    p3.ygrid.grid_line_color = '#5C5B5B'
-    p3.ygrid.minor_grid_line_color = '#373636'
+    p.xaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.minor_tick_line_color = '#FFFFFF'   
+    p.yaxis.axis_label_text_color='#FFFFFF'
 
-    p3.toolbar.logo = None
-    p3.border_fill_color = '#191919'
-    p3.background_fill_color = '#191919'
-    p3.legend.background_fill_alpha = 0.7
+    p.xgrid.grid_line_color = '#333333'
+    p.ygrid.grid_line_color = '#5C5B5B'
+    p.ygrid.minor_grid_line_color = '#373636'
 
-    p3.x_range.range_padding = 0.03
-    p3.xgrid.grid_line_color = None
-    p3.legend.location = "top_center"
-    p3.legend.orientation = "horizontal"
-    p3.yaxis[0].ticker.desired_num_ticks = 10
-    return p3
+    p.toolbar.logo = None
+    p.border_fill_color = '#191919'
+    p.background_fill_color = '#191919'
+    p.legend.background_fill_alpha = 0.7
 
-def getP4():
-    braceDF['receiveDate_dt'] = pd.to_datetime(braceDF['receiveDate']).apply(lambda x: x.replace(tzinfo=None))
-    g4 = braceDF.groupby(['receiveDate_dt',"sentimentPosition"], as_index = False).size()
-    g4 = g4.pivot_table(values='size'
-                        , index='receiveDate_dt'
-                        , columns='sentimentPosition'
-                        , aggfunc='first').reset_index().rename_axis(None, axis=1)#.set_index('receiveDate_dt')
-    g4.fillna(0, inplace=True)
-    # display(g4)
+    p.x_range.range_padding = 0.03
+    p.xgrid.grid_line_color = None
+    p.legend.location = "top_center"
+    p.legend.orientation = "horizontal"
+    p.yaxis[0].ticker.desired_num_ticks = 10
+    return p
 
-    #convert datetimes to strings
-    g4['receiveDate_dt'] = g4['receiveDate_dt'].dt.strftime('%Y-%m-%d')
-    #convert dataframe to dict
-    data4 = g4.to_dict(orient='list')
-    dates4 = g4['receiveDate_dt'].tolist()
-
-#     output_file(r'viz\\BraceSentimentByDay.html')
-
-    source4 = ColumnDataSource(data=data4)
-    p4 = figure( width=1200
-               , height=800
-               , x_range=dates4
-               , y_range=(0, g4[['neutral','oppose', 'support']].values.max() + 1000)
-               , title="Comment Sentiment by Day on ATF Docket (ATF-2021-0002)\nFactoring Criteria for Firearms with Attached 'Stabilizing Braces'"
-               , toolbar_location=None
-               , tools="")
-
-    p4.vbar(x=dodge('receiveDate_dt', -.2, range=p4.x_range), top='support', width=0.2, source=source4,
-           color="#1A71F2", legend_label="support")
-
-    p4.vbar(x=dodge('receiveDate_dt',  0,  range=p4.x_range), top='oppose', width=0.2, source=source4,
-           color="#F92518", legend_label="oppose")
-
-    p4.vbar(x=dodge('receiveDate_dt',  .2,  range=p4.x_range), top='neutral', width=0.2, source=source4,
-           color="#DEDEDE", legend_label="neutral")
+def getTotals(df, title):
+    # sns.set(font_scale=1.4)
+    # valuesCountDF =pd.DataFrame(df[['sentimentPosition']].value_counts())
+    # total = valuesCountDF['count'].values.sum()
+    # valuesCountDF.plot(kind='bar', figsize=(7, 6), rot=0)
+    # xlabel="Comments retrieved: \n{:,}"
+    # plt.xlabel(xlabel.format(total), labelpad=14)
+    # plt.ylabel("Count of Comments", labelpad=14)
+    # plt.title(title, y=1.02)
+    # return plt
+    g = pd.DataFrame(df.groupby(['sentimentPosition'], as_index = False).size())
 
 
-    p4.xaxis.formatter=DatetimeTickFormatter(
-            hours=["%I:00 %p"],
-            days=["%m-%d"],
-            months=["%m-%d"],
-            years=["%m-%d"]
-    )
-    p4.xaxis.major_label_orientation = math.pi/2
-    p4.xaxis.major_label_text_color = '#FFFFFF'
-    p4.yaxis.major_label_text_color = '#FFFFFF'
+    columns = g['sentimentPosition']#.to_dict()#(orient='list')
+    counts = g['size']/1000#.to_dict()
+    colors = ["#DEDEDE","#F92518","#1A71F2"]
+    y_top = (g['size'].values.max()+5000)/1000
+    source = ColumnDataSource(data=dict(columns=columns, counts=counts, color=colors))
+    p = figure(x_range=columns, y_range=(0,y_top), height=500  , width=500, title=title,
+            toolbar_location=None, tools="")
+    p.vbar(x='columns', top='counts', width=0.9, color='color', legend_field="columns", source=source)
+    p.xgrid.grid_line_color = None
 
-    p4.title.text_color = '#FFFFFF'
+    p.add_tools(HoverTool(tooltips=[("Comments","@counts")]))
+    
+    p.xaxis.major_label_text_color = '#FFFFFF'
+    p.yaxis.major_label_text_color = '#FFFFFF'
 
-    p4.xaxis.axis_line_color = '#FFFFFF'
-    p4.yaxis.axis_line_color = '#FFFFFF'
+    p.title.text_color = '#FFFFFF'
 
-    p4.xaxis.major_tick_line_color = '#FFFFFF'
-    p4.yaxis.major_tick_line_color = '#FFFFFF'
-    p4.yaxis.minor_tick_line_color = '#FFFFFF'   
+    p.xaxis.axis_line_color = '#FFFFFF'
+    p.yaxis.axis_line_color = '#FFFFFF'
 
-    p4.xgrid.grid_line_color = '#333333'
-    p4.ygrid.grid_line_color = '#5C5B5B'
-    p4.ygrid.minor_grid_line_color = '#373636'
+    p.xaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.major_tick_line_color = '#FFFFFF'
+    p.yaxis.minor_tick_line_color = '#FFFFFF'   
 
-    p4.toolbar.logo = None
-    p4.border_fill_color = '#191919'
-    p4.background_fill_color = '#191919'
-    p4.legend.background_fill_alpha = 0.7
+    p.xgrid.grid_line_color = '#333333'
+    p.ygrid.grid_line_color = '#5C5B5B'
+    p.ygrid.minor_grid_line_color = '#373636'
 
-    p4.x_range.range_padding = 0.03
-    p4.xgrid.grid_line_color = None
-    p4.legend.location = "top_center"
-    p4.legend.orientation = "horizontal"
-    p4.yaxis[0].ticker.desired_num_ticks = 10
-    return p4
+    p.toolbar.logo = None
+    p.border_fill_color = '#191919'
+    p.background_fill_color = '#191919'
 
-def getP5():
-    ################################ BRACE cumulative comment by day############################
-    g4 = braceDF.groupby(['receiveDate_dt',"sentimentPosition"], as_index = False).size()
-    g4 = g4.pivot_table(values='size'
-                        , index='receiveDate_dt'
-                        , columns='sentimentPosition'
-                        , aggfunc='first').reset_index().rename_axis(None, axis=1)
-    g4.fillna(0, inplace=True)
-    g4['receiveDate_dt'] = g4['receiveDate_dt'].dt.strftime('%Y-%m-%d')
-    g5 = g4.set_index('receiveDate_dt').cumsum()
-    g5= g5.reset_index()
-    #convert dataframe to dict
-    data5 = g5.to_dict(orient='list')
-    dates5 = g5['receiveDate_dt'].tolist()
-    source5 = ColumnDataSource(data=data5)
-    #get max possible value of plotted columns with some offset
-    p5 = figure( width=1200
-               , height=800
-               , x_range=dates5
-               , y_range=(0, g5[['neutral','oppose', 'support']].values.max() + 10000)
-               , title="Cumulative Comment Sentiment by Day on ATF Docket (ATF-2021-0002)\nFactoring Criteria for Firearms with Attached 'Stabilizing Braces'"
-               , toolbar_location=None
-               , tools="")
+    p.x_range.range_padding = 0.03
+    p.xgrid.grid_line_color = None
+    p.yaxis[0].ticker.desired_num_ticks = 10
+    # p.legend.background_fill_alpha = 0.7
+    p.legend.visible = False
+    p.toolbar.visible = False
+    p.yaxis.axis_label = "Thousands of Comments"
 
-    p5.line('receiveDate_dt', 'support', line_width=2, line_color="#1A71F2", legend_label='support', source=source5)
-    p5.line('receiveDate_dt', 'oppose', line_width=2, line_color="#F92518", legend_label='oppose', source=source5)
-    p5.line('receiveDate_dt', 'neutral', line_width=2, line_color="#DEDEDE", legend_label='neutral', source=source5)
+    return p
 
-    p5.xaxis.formatter=DatetimeTickFormatter(
-            hours=["%I:00 %p"],
-            days=["%m-%d"],
-            months=["%m-%d"],
-            years=["%m-%d"]
-    )
-    p5.xaxis.major_label_orientation = math.pi/2
-    p5.xaxis.major_label_text_color = '#FFFFFF'
-    p5.yaxis.major_label_text_color = '#FFFFFF'
+def refreshData(apiKey):
+    bumpDF = pd.read_csv(r'bumpstock_sentiment.csv', index_col = 'idx', header =0)
+    # print('bumpDF:'+ str(len(bumpDF)))
 
-    p5.title.text_color = '#FFFFFF'
+    receiverDF = pd.read_csv(r'receiver_sentiment.csv', index_col='idx', header=0)
+    # print('receiverDF: '+ str(len(receiverDF)))
 
-    p5.xaxis.axis_line_color = '#FFFFFF'
-    p5.yaxis.axis_line_color = '#FFFFFF'
+    braceDF = pd.read_csv(r'brace_sentiment.csv', index_col='idx', header=0)
+    # print('braceDF: '+ str(len(braceDF)))
 
-    p5.xaxis.major_tick_line_color = '#FFFFFF'
-    p5.yaxis.major_tick_line_color = '#FFFFFF'
-    p5.yaxis.minor_tick_line_color = '#FFFFFF'   
+    engagedDF = pd.read_csv(r'EngagedInBiz_sentiment.csv', index_col = 'idx', header =0)
+    # print('engagedDF:'+ str(len(engagedDF)))
 
-    p5.xgrid.grid_line_color = '#333333'
-    p5.ygrid.grid_line_color = '#5C5B5B'
-    p5.ygrid.minor_grid_line_color = '#373636'
+    chartHeight = 700
+    chartWidth =1100
 
-    p5.toolbar.logo = None
-    p5.border_fill_color = '#191919'
-    p5.background_fill_color = '#191919'
-    p5.legend.background_fill_alpha = 0.7
+    docketName = 'ATF-2018-0002-0001'
+    docketID = '0900006483074524'
+    bumpCommentsTitle = 'Bump-Stock Type Device Comment Statistics:'
+    bumpCommentsDownloaded = len(bumpDF)#engagedDF.index.values.max()
+    bumpCommentsSubmitted= 193297 #getSubmitted(docketName)
+    bumpCommentsApproved = 95084 #getApproved(docketID)
+    bumpCommentsUnpublished = bumpCommentsSubmitted-bumpCommentsApproved
+    bumpCommentsUnscored = bumpCommentsApproved-bumpCommentsDownloaded
+    bumpStatsFormatted = getStatsString(   
+                                           False
+                                         , bumpCommentsTitle
+                                         , bumpCommentsSubmitted
+                                         , bumpCommentsApproved
+                                         , bumpCommentsUnpublished
+                                         , bumpCommentsDownloaded
+                                         , bumpCommentsUnscored
+                                        )
+    print (bumpStatsFormatted)
 
-    p5.x_range.range_padding = 0.03
-    p5.xgrid.grid_line_color = None
-    p5.legend.location = "top_center"
-    p5.legend.orientation = "horizontal"
-    p5.yaxis[0].ticker.desired_num_ticks = 10
-    p5.yaxis.formatter=NumeralTickFormatter(format="0")
-    return p5
+    docketName = 'ATF-2021-0001-0001'
+    docketID = '0900006485512a37'
+    receiverCommentsTitle = 'Definition of Frame or Receiver Statistics:'
+    receiverCommentsDownloaded = len(receiverDF)#engagedDF.index.values.max()
+    receiverCommentsSubmitted= 294633 #getSubmitted(docketName)
+    receiverCommentsApproved = 249299 #getApproved(docketID)
+    receiverCommentsUnpublished = receiverCommentsSubmitted-receiverCommentsApproved
+    receiverCommentsUnscored = receiverCommentsApproved-receiverCommentsDownloaded
+    receiverStatsFormatted = getStatsString( 
+                                              False 
+                                            , receiverCommentsTitle
+                                            , receiverCommentsSubmitted
+                                            , receiverCommentsApproved
+                                            , receiverCommentsUnpublished
+                                            , receiverCommentsDownloaded
+                                            , receiverCommentsUnscored
+                                         )
+    print (receiverStatsFormatted)
 
-def getP6():
-    #####################GENERATE RECEIVERS Approval Rate HTML #########################
-    braceDF['postedDate_dt'] = pd.to_datetime(braceDF['postedDate']).apply(lambda x: x.replace(tzinfo=None))
-    braceDF['receiveDate_dt'] = pd.to_datetime(braceDF['receiveDate']).apply(lambda x: x.replace(tzinfo=None))
-    braceDF['processLagDays'] = (braceDF['postedDate_dt'] - braceDF['receiveDate_dt']).dt.days
-    g6 = braceDF.groupby('postedDate_dt').agg({'comment':'size', 'processLagDays':'mean'})
-    g6.fillna(0, inplace=True)
-    g6= g6.reset_index()
-    #convert datetimes to strings
-    g6['postedDate_dt'] = g6['postedDate_dt'].dt.strftime('%Y-%m-%d')
-    #convert dataframe to dict
-    data6 = g6.to_dict(orient='list')
-    dates6 = g6['postedDate_dt'].tolist()
-    source6 = ColumnDataSource(data=data6)
-    #get max possible value of plotted columns with some offset
-    p6 = figure( width=1200
-               , height=800
-               , x_range=dates6
-               , y_range=(0, g6[['comment']].values.max() + 1000)
-               , y_axis_label="Count of Comments Published"
-               , title="Count of Comments approved by Day on ATF Docket (ATF-2021-0002)\nFactoring Criteria for Firearms with Attached 'Stabilizing Braces'"
-               , toolbar_location=None
-               , tools="")
-    p6.extra_y_ranges = {"processLagDays": Range1d(start=0, end=g6['processLagDays'].values.max()+1)}
-    p6.add_layout(LinearAxis(y_range_name="processLagDays",axis_label_text_color='#FFFFFF', axis_label='Days between Submission and Publication'), 'right')
+    docketName = 'ATF-2021-0002-0001'
+    docketID = '0900006484b63c61'
+    braceCommentsTitle = 'Factoring Criteria for Firearms with Attached "Stabilizing Braces" Statistics:'
+    braceCommentsDownloaded = len(braceDF)#engagedDF.index.values.max()
+    braceCommentsSubmitted= 237569 #getSubmitted(docketName)
+    braceCommentsApproved = 210614#getApproved(docketID)
+    braceCommentsUnpublished = braceCommentsSubmitted-braceCommentsApproved
+    braceCommentsUnscored = braceCommentsApproved-braceCommentsDownloaded
+    braceStatsFormatted = getStatsString( 
+                                              False 
+                                            , braceCommentsTitle
+                                            , braceCommentsSubmitted
+                                            , braceCommentsApproved
+                                            , braceCommentsUnpublished
+                                            , braceCommentsDownloaded
+                                            , braceCommentsUnscored
+                                         )
+    print (braceStatsFormatted)
 
-    p6.vbar(x=dodge('postedDate_dt',  0,  range=p6.x_range), top='comment', width=0.2, source=source6,
-           color="#DEDEDE", legend_label="Count of Comments Published by Day")
-    p6.line('postedDate_dt'
-           , 'processLagDays'
-           , line_width=2
-           , line_color="#1A71F2"
-           , legend_label='Days between Submission and Publication'
-           , source=source6
-           , y_range_name = 'processLagDays'
-          )
+    docketName = 'ATF-2023-0002-0001'
+    docketID = '0900006485f5bba1'
+    engagedCommentsTitle = 'Definition of Engaged in the Business as a Dealer in Firearms Comment Statistics:'
+    engagedCommentsDownloaded = len(engagedDF)#engagedDF.index.values.max()
+    engagedCommentsSubmitted= getSubmitted(docketName)
+    engagedCommentsApproved = getApproved(docketID)
+    engagedCommentsUnpublished = engagedCommentsSubmitted-engagedCommentsApproved
+    engagedCommentsUnscored = engagedCommentsApproved-engagedCommentsDownloaded
+    engagedStatsFormatted = getStatsString( 
+                                            True
+                                          , engagedCommentsTitle
+                                          , engagedCommentsSubmitted
+                                          , engagedCommentsApproved
+                                          , engagedCommentsUnpublished
+                                          , engagedCommentsDownloaded
+                                          , engagedCommentsUnscored
+                                         )
+    print(engagedStatsFormatted)
 
-    p6.xaxis.formatter=DatetimeTickFormatter(
-            hours=["%I:00 %p"],
-            days=["%m-%d"],
-            months=["%m-%d"],
-            years=["%m-%d"]
-    )
-    p6.xaxis.major_label_orientation = math.pi/2
-    p6.xaxis.major_label_text_color = '#FFFFFF'
+def getGrid():
 
-    p6.title.text_color = '#FFFFFF'
+    titleBumpTotals = "ATF Docket (ATF-2018-0002)\nBump-Stock Type Device\n"+"Comment Totals"
+    pltBumpTotals = getTotals(bumpDF, titleBumpTotals)
 
-    p6.xaxis.axis_line_color = '#FFFFFF'
-    p6.yaxis.axis_line_color = '#FFFFFF'
-    p6.yaxis.major_label_text_color = '#FFFFFF'
+    titleReceiverTotals = f"ATF Docket (ATF-2021-0001)\nDefinition of Frame or Receiver and \nIdentification of Firearms\nComment Totals"
+    pltReceiverTotals = getTotals(receiverDF, titleReceiverTotals)
 
-    p6.xaxis.major_tick_line_color = '#FFFFFF'
-    p6.yaxis.major_tick_line_color = '#FFFFFF'
-    p6.yaxis.minor_tick_line_color = '#FFFFFF'   
-    p6.yaxis.axis_label_text_color='#FFFFFF'
+    titleBraceTotals = "ATF Docket (ATF-2021-0002)\nFactoring Criteria for\nFirearms with Attached 'Stabilizing Braces'\nComment Totals"
+    pltBraceTotals = getTotals(braceDF, titleBraceTotals)
 
-    p6.xgrid.grid_line_color = '#333333'
-    p6.ygrid.grid_line_color = '#5C5B5B'
-    p6.ygrid.minor_grid_line_color = '#373636'
+    titleEngagedTotals = "ATF Docket (ATF-2023-0002)\nDefinition of Engaged in the Business \nas a Dealer in Firearms\nComment Totals"
+    pltEngagedTotals = getTotals(engagedDF, titleEngagedTotals)
 
-    p6.toolbar.logo = None
-    p6.border_fill_color = '#191919'
-    p6.background_fill_color = '#191919'
-    p6.legend.background_fill_alpha = 0.7
+    plots =[[pltEngagedTotals, pltBraceTotals], [pltReceiverTotals, pltBumpTotals]]
 
-    p6.x_range.range_padding = 0.03
-    p6.xgrid.grid_line_color = None
-    p6.legend.location = "top_center"
-    p6.legend.orientation = "horizontal"
-    p6.yaxis[0].ticker.desired_num_ticks = 10
-    return p6
+    grid = gridplot(plots, width=420, height=400, toolbar_options=dict(logo=None))
+    return grid
 
-def getChart():
-    p1Panel = Panel(child=getP1(), title='Receiver By Day')
-    p2Panel = Panel(child=getP2(), title='Cuml Receiver By Day')
-    p3Panel = Panel(child=getP3(), title='Receiver Comments Processed By Day')
-    p4Panel = Panel(child=getP4(), title='Brace By Day')
-    p5Panel = Panel(child=getP5(), title='Cuml Brace By Day')
-    p6Panel = Panel(child=getP6(), title='Brace Comments Processed By Day')
-    tabs = Tabs(tabs=[p1Panel,p2Panel, p3Panel, p4Panel, p5Panel, p6Panel])
+def getFinalChart():
+    # EXPORT BOKEH PLOT########################################
+
+    p1Panel = TabPanel(child=getDailyChart(receiverDF
+                                        , "Comment Sentiment by Day on ATF Docket (ATF-2021-0001)\
+                                            \nDefinition of Frame or Receiver and Identification of Firearms"),
+                                        title= 'Recveiver By Day')
+    p2Panel = TabPanel(child=getCumlDailyChart(receiverDF
+                                        , "Cumulative Comment Sentiment by Day on ATF Docket (ATF-2021-0001)\
+                                            \nDefinition of Frame or Receiver and Identification of Firearms")
+                                        , title='Cuml Receiver By Day')
+    p3Panel = TabPanel(child=getCommentsAprovedByDay(receiverDF
+                                        , "Count of Comments approved by Day on ATF Docket (ATF-2021-0001)\
+                                            \nDefinition of Frame or Receiver and Identification of Firearms")
+                                        , title='Receiver Approval Lag')
+
+    p4Panel = TabPanel(child=getDailyChart(braceDF
+                                        ,"Comment Sentiment by Day on ATF Docket (ATF-2021-0002)\
+                                            \nFactoring Criteria for Firearms with Attached 'Stabilizing Braces'" )
+                                        , title='Brace By Day')
+    p5Panel = TabPanel(child=getCumlDailyChart(braceDF
+                                        , "Cumulative Comment Sentiment by Day on ATF Docket (ATF-2021-0002)\
+                                            \nFactoring Criteria for Firearms with Attached 'Stabilizing Braces'")
+                                        , title='Cuml Brace By Day')
+    p6Panel = TabPanel(child=getCommentsAprovedByDay(braceDF
+                                        , "Count of Comments approved by Day on ATF Docket (ATF-2021-0002)\
+                                            \nFactoring Criteria for Firearms with Attached 'Stabilizing Braces'")
+                                        , title='Receiver Approval Lag')
+
+    p7Panel = TabPanel(child=getDailyChart(bumpDF
+                                        , "Comment Sentiment by Day on ATF Docket (ATF-2018-0002)\nBump-Stock Type Device")
+                                        , title='Bump-stock By Day')
+    p8Panel = TabPanel(child=getCumlDailyChart(bumpDF
+                                        , "Cumulative Comment Sentiment by Day on ATF Docket (ATF-2018-0002)\nBump-Stock Type Device")
+                                        , title='Cuml Bump-stock By Day')
+    p9Panel = TabPanel(child=getCommentsAprovedByDay(bumpDF
+                                        , "Count of Comments approved by Day on ATF Docket (ATF-2018-0002)\nBump-Stock Type Device'")
+                                        , title='Bump-stock Approval Lag')
+
+
+    p10Panel = TabPanel(child=getDailyChart(engagedDF
+                                        ,"Comment Sentiment by Day on ATF Docket (ATF-2023-0002)\
+                                            \nDefinition of Engaged in the Business as a Dealer in Firearms" )
+                                        , title='Engaged Dealer By Day')
+    p11Panel = TabPanel(child=getCumlDailyChart(engagedDF
+                                        , "Cumulative Comment Sentiment by Day on ATF Docket (ATF-2023-0002)\
+                                            \nDefinition of Engaged in the Business as a Dealer in Firearms") 
+                                        , title='Cuml Engaged Dealer By Day')
+    p12Panel = TabPanel(child=getCommentsAprovedByDay(engagedDF
+                                        , "Count of Comments approved by Day on ATF Docket (ATF-2023-0002)\
+                                            \nDefinition of Engaged in the Business as a Dealer in Firearms")
+                                        , title='Engaged Dealer Approval Lag')
+    p13Panel = TabPanel(child=getGrid(), title='Docket Comments')
+
+
+    outfilePath = r'PATH'
+    output_file(outfilePath, title = 'ATF Shenanigans')
+
+    # Assign the panels to Tabs
+    tabs = Tabs(tabs=[
+          p13Panel
+        , p10Panel
+        , p11Panel
+        , p12Panel
+        , p1Panel
+        , p2Panel
+        # , p3Panel
+        , p4Panel
+        , p5Panel
+        # , p6Panel
+        , p7Panel
+        , p8Panel
+        # , p9Panel
+        ])
+
+
+    # Show the tabbed layout
+    # show(tabs)
+
+    soup = BeautifulSoup(open(outfilePath),'html.parser')
+    title = soup.find('title')
+    link = soup.new_tag('link')
+    link['rel'] = "icon" 
+    link['href']="favicon.ico" 
+    link['type']="image/x-icon"
+    title.insert_after(link)
+
+
+    extra_html = '''
+        <div class="text">
+            <p> last updated at: '''+ str(datetime.now())+'''</p>'''+engagedStatsFormatted+'''</div>'''
+
+
+    soup.body.insert(len(soup.body.contents), BeautifulSoup(extra_html, 'html.parser'))
+
+    with open(outfilePath, "w") as file:
+        file.write(str(soup))
+
     return tabs
